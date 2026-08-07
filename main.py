@@ -3,17 +3,17 @@
 """
 오즈 공고봇 — 매일 오전 8시(KST) 지원사업·공모 수집 → 카카오톡 「나에게 보내기」
 
-수집   구글 뉴스 RSS(키 불필요) + 기업마당 + 경기도교육청 + (선택) 네이버 검색 API
+수집   구글뉴스 RSS 17개 키워드 + 기업마당 + 교육청 21곳 + 지정 사이트 14곳
 판정   오즈 적합도 점수화 → 🔴즉시 / 🟡검토 / ⬜참고
 저장   docs/index.html (GitHub Pages) + docs/archive/YYYY-MM-DD.html
-발송   카카오 메모 API (리스트 템플릿, 상위 3건)
+발송   카카오 메모 API (리스트 템플릿, 최대 3통 × 3건 = 9건)
 
 환경변수 (GitHub Secrets)  ※ 필수는 3개뿐
   KAKAO_REST_KEY  / KAKAO_REFRESH_TOKEN / PAGES_URL
   NAVER_CLIENT_ID / NAVER_CLIENT_SECRET  ← 선택. 없으면 자동으로 건너뜀
     (2026.08 기준 네이버 검색 API는 네이버 클라우드 플랫폼 API HUB로 이관됨)
 """
-import os, re, json, html, pathlib, datetime, urllib.parse
+import os, re, json, html, time, pathlib, datetime, urllib.parse
 import requests
 from bs4 import BeautifulSoup
 
@@ -33,11 +33,21 @@ PAGES_URL = os.environ.get("PAGES_URL", "").rstrip("/")
 # 키워드
 # ─────────────────────────────────────────────────────────────
 QUERIES = [
-    "진로체험 업체 공모", "진로직업체험 캠프 업체", "방문형 진로체험 공모",
-    "진로체험처 모집", "자유학기제 프로그램 공모", "진로교육 위탁 공고",
+    # ① 방문형 캠프 참여 업체 공모  ⭐ 오즈 최적
+    "학교 방문형 진로직업체험 캠프 참여 업체 공모",
+    "진로체험 업체 공모", "진로체험처 모집", "진로체험 참여업체 모집",
+    # ② 센터 민간위탁
+    "진로체험지원센터 민간위탁 수탁기관", "거점 진로체험지원센터 공모",
+    # ③ 진로교육원 수탁
+    "진로교육원 체험프로그램 위탁", "위탁사업기관 공모 교육청",
+    # ④ 박람회 부스·공연  ⭐ 오즈 최적
+    "진로직업박람회 체험부스 모집", "진로콘서트 공연 모집",
+    # 오즈 자격
     "사회적기업 지원사업 공고", "장애인기업 우대 공고",
-    "경기도교육청 진로체험", "시흥 교육 지원사업",
-    "학교 초청공연 입찰", "청소년 진로 프로그램 공모",
+    # 지역·기타
+    "경기도교육청 진로체험 공모", "시흥 교육 지원사업",
+    "학교 초청공연 입찰", "자유학기제 프로그램 공모",
+    "문화예술교육 지원사업 공모",
 ]
 
 # 점수 규칙 (키워드, 가점, 사유)
@@ -52,12 +62,18 @@ SCORE_RULES = [
     (r"학교|초등|중학교|고등학교|청소년", 15, "오즈 고객"),
     (r"공연|뮤지컬|마술|문화예술", 15, "오즈 상품"),
     (r"교육기부|진로교육", 15, "오즈 인증 분야"),
+    (r"문화예술교육|예술강사|생활문화|문화다양성", 30, "문화예술교육 분야"),
+    (r"꿈의학교|예술꽃|방과후|늘봄", 25, "학교 연계 사업"),
+    (r"방문형|찾아가는", 25, "찾아가는 방식 = 오즈 구조"),
+    (r"진로체험지원센터|진로교육원|거점센터", 25, "센터 위탁"),
+    (r"박람회|체험부스|진로콘서트", 25, "박람회 부스·공연"),
+    (r"수탁기관|민간위탁|위탁사업기관", 20, "위탁 발주"),
 ]
 
 EXCLUDE = re.compile(
     r"채용|구인|인턴|아르바이트|수강생\s*모집|학생\s*모집|"
     r"대학생\s*대상|창업경진대회|공모전\s*수상|입상|당선작|"
-    r"장학금|졸업|입시|학원생"
+    r"장학금|졸업|입시|학원생|관람|전시\s*안내|공연\s*예매|티켓|대관\s*안내"
 )
 
 
@@ -122,34 +138,118 @@ def google_news(query, limit=10):
         return []
 
 
-def goe_notice():
-    """경기도교육청 — 공고·입찰 목록 (베스트 에포트)"""
+def edu_sites():
+    """시도교육청 17곳 + 경기 교육지원청 4곳 — 공고성 링크 수집 (베스트 에포트)"""
     out = []
-    for url in [
-        "https://www.goe.go.kr/home/bbs/bbsList.do?menuId=100000000000102",
-        "https://www.goe.go.kr/",
-    ]:
+    for name, url in EDU_SITES:
+        try:
+            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            r.encoding = r.apparent_encoding
+            soup = BeautifulSoup(r.text, "html.parser")
+            n = 0
+            for a in soup.select("a[href]"):
+                t = a.get_text(" ", strip=True)
+                if not (10 <= len(t) <= 90) or not NOTICE_PAT.search(t):
+                    continue
+                href = a.get("href", "")
+                if href.startswith("#") or href.lower().startswith("javascript"):
+                    continue
+                out.append({
+                    "title": t, "desc": name,
+                    "url": href if href.startswith("http") else urllib.parse.urljoin(url, href),
+                    "src": name, "deadline": "",
+                })
+                n += 1
+                if n >= 6:
+                    break
+            if n:
+                print(f"    {name} {n}건")
+        except Exception as e:
+            print(f"[warn] {name}: {str(e)[:50]}")
+    return out
+
+
+# 사모님이 평소 보시는 사이트 (2026.08.07 전부 접속 확인 완료)
+CULTURE_SITES = [
+    # ── 문화예술 ─────────────────────────────────
+    ("모모365",              "https://www.momo365.net/"),          # ⭐ 문화사업 공고 포털
+    ("한국문화예술교육진흥원", "https://arte.or.kr/index.do"),
+    ("경기문화재단",         "https://www.ggcf.kr/"),
+    ("인천문화재단",         "https://www.ifac.or.kr/index.do"),
+    ("서울문화재단",         "https://www.sfac.or.kr/index.do"),
+    ("부천문화재단",         "https://www.bcf.or.kr/base/main/view"),
+    ("지역문화진흥원",       "https://www.rcs.or.kr/home/kor/main.do"),
+    ("영화진흥위원회",       "https://www.kofic.or.kr/kofic/business/main/main.do"),
+    # ── 오즈 자격 기반 ───────────────────────────
+    ("장애인기업종합지원센터", "https://www.debc.or.kr/"),           # ⭐ 오즈 = 장애인기업
+    ("한국사회적기업진흥원",  "https://www.socialenterprise.or.kr/"),
+    ("한국청소년활동진흥원",  "https://www.kywa.or.kr/main/main.jsp"),
+    # ── 지역 ────────────────────────────────────
+    ("시흥시청",             "https://www.siheung.go.kr/main.do"),
+    ("경기도일자리재단",     "https://www.gjf.or.kr/main/main.do"),
+    ("경기도경제과학진흥원",  "https://www.gbsa.or.kr/"),
+]
+# 미연동: 나라장터(g2b) · 학교장터(s2b) · e나라도움(gosims) — 로그인/JS 렌더링 필요.
+#         공공데이터포털 OpenAPI 키 발급 후 별도 연동 예정.
+
+# 시도교육청 17곳 + 경기 주요 교육지원청 (2026.08 기준 도메인)
+EDU_SITES = [
+    ("경기도교육청",   "https://www.goe.go.kr/"),
+    ("서울시교육청",   "https://www.sen.go.kr/"),
+    ("인천시교육청",   "https://www.ice.go.kr/"),
+    ("경남교육청",     "https://www.gne.go.kr/"),
+    ("광주시교육청",   "https://www.gen.go.kr/"),
+    ("제주도교육청",   "https://www.jje.go.kr/"),
+    ("전북교육청",     "https://www.jbe.go.kr/"),
+    ("경북교육청",     "https://www.gbe.kr/"),
+    ("충북교육청",     "https://www.cbe.go.kr/"),
+    ("부산시교육청",   "https://www.pen.go.kr/"),
+    ("대구시교육청",   "https://www.dge.go.kr/"),
+    ("대전시교육청",   "https://www.dje.go.kr/"),
+    ("울산시교육청",   "https://www.use.go.kr/"),
+    ("세종시교육청",   "https://www.sje.go.kr/"),
+    ("강원교육청",     "https://www.gwe.go.kr/"),
+    ("충남교육청",     "https://www.cne.go.kr/"),
+    ("전남교육청",     "https://www.jne.go.kr/"),
+    # 경기 주요 교육지원청 (오즈 인접)
+    ("시흥교육지원청", "https://www.goesh.kr/"),
+    ("안산교육지원청", "https://www.goeas.kr/"),
+    ("광명교육지원청", "https://www.goegm.kr/"),
+    ("부천교육지원청", "https://www.goebc.kr/"),
+]
+
+# 공고성 제목만 추리는 패턴
+NOTICE_PAT = re.compile(r"공모|모집|지원사업|선정|접수|위탁|입찰|용역|공고")
+
+
+def culture_sites():
+    """문화재단·진흥원 메인에서 공고성 링크만 수집 (베스트 에포트)"""
+    out = []
+    for name, url in CULTURE_SITES:
         try:
             r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
             r.encoding = r.apparent_encoding
             soup = BeautifulSoup(r.text, "html.parser")
+            n = 0
             for a in soup.select("a[href]"):
                 t = a.get_text(" ", strip=True)
-                if len(t) < 8 or len(t) > 90:
-                    continue
-                if not re.search(r"공모|모집|입찰|용역|위탁|선정", t):
+                if not (10 <= len(t) <= 90) or not NOTICE_PAT.search(t):
                     continue
                 href = a.get("href", "")
+                if href.startswith("#") or href.lower().startswith("javascript"):
+                    continue
                 out.append({
-                    "title": t, "desc": "경기도교육청",
+                    "title": t, "desc": name,
                     "url": href if href.startswith("http") else urllib.parse.urljoin(url, href),
-                    "src": "경기도교육청", "deadline": "",
+                    "src": name, "deadline": "",
                 })
-            if out:
-                break
+                n += 1
+                if n >= 8:
+                    break
+            print(f"    {name} {n}건")
         except Exception as e:
-            print(f"[warn] goe: {e}")
-    return out[:20]
+            print(f"[warn] {name}: {str(e)[:60]}")
+    return out
 
 
 def bizinfo():
@@ -317,42 +417,61 @@ def kakao_token():
     return j["access_token"]
 
 
+MAX_MSG = 3          # 카톡 최대 통수 (통당 3건 → 최대 9건)
+IMG = "https://t1.kakaocdn.net/kakaocorp/Service/KakaoTalk/pc/slide/talkpc_theme_01.jpg"
+
+
 def kakao_send(items):
-    """리스트 템플릿: 상위 3건. 링크는 전부 PAGES_URL (카카오 도메인 제한 회피)"""
+    """리스트 템플릿을 여러 통으로 나눠 발송. 통당 3건 · 최대 9건.
+    링크는 전부 PAGES_URL (카카오 도메인 제한 회피)"""
     if not (KAKAO_KEY and KAKAO_REFRESH and PAGES_URL):
         print("[skip] 카카오 설정 없음")
         return
-    top = [i for i in items if i["grade"] in ("🔴", "🟡")][:3]
+    top = [i for i in items if i["grade"] in ("🔴", "🟡")][:MAX_MSG * 3]
     if not top:
         print("[skip] 보고할 건 없음 — 카톡 미발송")
         return
 
-    n = sum(1 for i in items if i["grade"] == "🔴")
+    n_hot = sum(1 for i in items if i["grade"] == "🔴")
     link = {"web_url": PAGES_URL, "mobile_web_url": PAGES_URL}
-    contents = [{
-        "title": f"{i['grade']} {i['title'][:38]}",
-        "description": (f"마감 {i['days_left']}일 전 · " if i.get("days_left") is not None else "") + i["why"][:40],
-        "image_url": "https://t1.kakaocdn.net/kakaocorp/Service/KakaoTalk/pc/slide/talkpc_theme_01.jpg",
-        "link": link,
-    } for i in top]
-    while len(contents) < 2:                       # 리스트 템플릿은 2개 이상 필수
-        contents.append({"title": "전체 브리핑 보기", "description": "오늘 수집한 전체 목록",
-                         "image_url": contents[0]["image_url"], "link": link})
+    token = kakao_token()
+    pages = [top[i:i + 3] for i in range(0, len(top), 3)]
 
-    payload = {
-        "object_type": "list",
-        "header_title": f"[오즈 {TODAY.month}/{TODAY.day}] 즉시 {n}건 · 총 {len(items)}건",
-        "header_link": link,
-        "contents": contents,
-        "buttons": [{"title": "전체 브리핑 열기", "link": link}],
-    }
-    r = requests.post(
-        "https://kapi.kakao.com/v2/api/talk/memo/default/send",
-        headers={"Authorization": f"Bearer {kakao_token()}"},
-        data={"template_object": json.dumps(payload, ensure_ascii=False)},
-        timeout=15,
-    )
-    print("[kakao]", r.status_code, r.text[:200])
+    for pi, page in enumerate(pages, 1):
+        contents = []
+        for i in page:
+            dl = f"마감 {i['days_left']}일 전 · " if i.get("days_left") is not None else ""
+            org = (i.get("desc") or i.get("src") or "").strip()[:16]
+            contents.append({
+                "title": f"{i['grade']} {i['title'][:38]}",
+                "description": f"{dl}{org} · {i['why'][:34]}",
+                "image_url": IMG,
+                "link": link,
+            })
+        while len(contents) < 2:                    # 리스트 템플릿은 2개 이상 필수
+            contents.append({"title": "전체 브리핑 보기", "description": "오늘 수집한 전체 목록",
+                             "image_url": IMG, "link": link})
+
+        head = (f"[오즈 {TODAY.month}/{TODAY.day}] 🔴{n_hot}건 · 총 {len(items)}건"
+                if pi == 1 else f"[오즈 {TODAY.month}/{TODAY.day}] 이어서 ({pi}/{len(pages)})")
+
+        payload = {
+            "object_type": "list",
+            "header_title": head,
+            "header_link": link,
+            "contents": contents,
+            "buttons": [{"title": "전체 브리핑 열기", "link": link}],
+        }
+        r = requests.post(
+            "https://kapi.kakao.com/v2/api/talk/memo/default/send",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"template_object": json.dumps(payload, ensure_ascii=False)},
+            timeout=15,
+        )
+        print(f"[kakao {pi}/{len(pages)}]", r.status_code, r.text[:120])
+        if r.status_code != 200:
+            break                                   # 실패하면 나머지 통 중단
+        time.sleep(1)                               # 연속 발송 간격
 
 
 # ─────────────────────────────────────────────────────────────
@@ -365,8 +484,11 @@ def main():
     n = len(raw); raw += bizinfo()
     print(f"  기업마당 {len(raw)-n}건")
 
-    n = len(raw); raw += goe_notice()
-    print(f"  경기도교육청 {len(raw)-n}건")
+    n = len(raw); print("  교육청 21곳:"); raw += edu_sites()
+    print(f"  교육청 합계 {len(raw)-n}건")
+
+    n = len(raw); print("  지정 사이트 14곳:"); raw += culture_sites()
+    print(f"  지정 사이트 합계 {len(raw)-n}건")
 
     if NAVER_ID:                            # 선택 — 키가 있을 때만
         n = len(raw)
