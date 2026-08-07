@@ -1,0 +1,38 @@
+name: 오즈 공고 브리핑
+
+on:
+  schedule:
+    - cron: '13 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: 공고 수집 및 발송
+        env:
+          NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          KAKAO_REST_KEY:      ${{ secrets.KAKAO_REST_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          PAGES_URL:           ${{ secrets.PAGES_URL }}
+        run: python main.py
+
+      - name: 결과 저장
+        run: |
+          git config user.name  "oz-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add docs seen.json
+          git diff --staged --quiet || git commit -m "brief $(date -u +%Y-%m-%d)"
+          git push
