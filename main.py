@@ -3,15 +3,15 @@
 """
 오즈 공고봇 — 매일 오전 8시(KST) 지원사업·공모 수집 → 카카오톡 「나에게 보내기」
 
-수집   네이버 검색 API(웹문서·뉴스) + 기업마당
+수집   구글 뉴스 RSS(키 불필요) + 기업마당 + 경기도교육청 + (선택) 네이버 검색 API
 판정   오즈 적합도 점수화 → 🔴즉시 / 🟡검토 / ⬜참고
 저장   docs/index.html (GitHub Pages) + docs/archive/YYYY-MM-DD.html
 발송   카카오 메모 API (리스트 템플릿, 상위 3건)
 
-환경변수 (GitHub Secrets)
-  NAVER_CLIENT_ID / NAVER_CLIENT_SECRET
-  KAKAO_REST_KEY  / KAKAO_REFRESH_TOKEN
-  PAGES_URL        예) https://아이디.github.io/oz-brief
+환경변수 (GitHub Secrets)  ※ 필수는 3개뿐
+  KAKAO_REST_KEY  / KAKAO_REFRESH_TOKEN / PAGES_URL
+  NAVER_CLIENT_ID / NAVER_CLIENT_SECRET  ← 선택. 없으면 자동으로 건너뜀
+    (2026.08 기준 네이버 검색 API는 네이버 클라우드 플랫폼 API HUB로 이관됨)
 """
 import os, re, json, html, pathlib, datetime, urllib.parse
 import requests
@@ -89,6 +89,67 @@ def naver_search(query, kind="webkr", display=10):
     except Exception as e:
         print(f"[warn] naver {kind} '{query}': {e}")
         return []
+
+
+def google_news(query, limit=10):
+    """구글 뉴스 RSS — API 키가 필요 없다. 주력 수집원."""
+    url = ("https://news.google.com/rss/search?q="
+           + urllib.parse.quote(query) + "&hl=ko&gl=KR&ceid=KR:ko")
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        out = []
+        for it in soup.find_all("item")[:limit]:
+            t = it.find("title")
+            l = it.find("link")
+            s = it.find("source")
+            if not t:
+                continue
+            link = (l.next_sibling or "").strip() if l else ""
+            if not link.startswith("http"):
+                link = (l.get_text(strip=True) if l else "")
+            out.append({
+                "title": strip_tags(t.get_text()),
+                "desc": (s.get_text(strip=True) if s else ""),
+                "url": link,
+                "src": "구글뉴스",
+                "deadline": "",
+            })
+        return out
+    except Exception as e:
+        print(f"[warn] gnews '{query}': {e}")
+        return []
+
+
+def goe_notice():
+    """경기도교육청 — 공고·입찰 목록 (베스트 에포트)"""
+    out = []
+    for url in [
+        "https://www.goe.go.kr/home/bbs/bbsList.do?menuId=100000000000102",
+        "https://www.goe.go.kr/",
+    ]:
+        try:
+            r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            r.encoding = r.apparent_encoding
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select("a[href]"):
+                t = a.get_text(" ", strip=True)
+                if len(t) < 8 or len(t) > 90:
+                    continue
+                if not re.search(r"공모|모집|입찰|용역|위탁|선정", t):
+                    continue
+                href = a.get("href", "")
+                out.append({
+                    "title": t, "desc": "경기도교육청",
+                    "url": href if href.startswith("http") else urllib.parse.urljoin(url, href),
+                    "src": "경기도교육청", "deadline": "",
+                })
+            if out:
+                break
+        except Exception as e:
+            print(f"[warn] goe: {e}")
+    return out[:20]
 
 
 def bizinfo():
@@ -297,12 +358,25 @@ def kakao_send(items):
 # ─────────────────────────────────────────────────────────────
 def main():
     raw = []
-    for q in QUERIES:
-        raw += naver_search(q, "webkr", 10)
-    for q in QUERIES[:6]:
-        raw += naver_search(q, "news", 5)
-    raw += bizinfo()
-    print(f"[수집] {len(raw)}건")
+    for q in QUERIES:                       # 주력 — 키 불필요
+        raw += google_news(q, 10)
+    print(f"  구글뉴스 {len(raw)}건")
+
+    n = len(raw); raw += bizinfo()
+    print(f"  기업마당 {len(raw)-n}건")
+
+    n = len(raw); raw += goe_notice()
+    print(f"  경기도교육청 {len(raw)-n}건")
+
+    if NAVER_ID:                            # 선택 — 키가 있을 때만
+        n = len(raw)
+        for q in QUERIES:
+            raw += naver_search(q, "webkr", 10)
+        print(f"  네이버 {len(raw)-n}건")
+    else:
+        print("  네이버 건너뜀 (키 없음 — 정상)")
+
+    print(f"[수집] 합계 {len(raw)}건")
 
     seen = load_seen()
     items, new_keys = [], set()
