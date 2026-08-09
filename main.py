@@ -68,7 +68,33 @@ SCORE_RULES = [
     (r"진로체험지원센터|진로교육원|거점센터", 25, "센터 위탁"),
     (r"박람회|체험부스|진로콘서트", 25, "박람회 부스·공연"),
     (r"수탁기관|민간위탁|위탁사업기관", 20, "위탁 발주"),
+    (r"체험처\s*모집|참여\s*업체|참여업체|상시\s*모집|공모\s*선정", 30, "업체를 뽑는 건"),
 ]
+
+# 🔴 「내가 신청할 수 있는 건」인가 — 제목에 이 말이 없으면 그냥 남의 소식이다
+ACTION = re.compile(
+    r"모집|공모|신청|접수|위탁|입찰|용역|공고|선정|참여\s*업체|체험처|지원사업|사업\s*설명회"
+)
+NEWS_ONLY = -45          # 행동할 수 없는 단순 보도 감점
+
+# ─────────────────────────────────────────────────────────────
+# 🔴 지역 자격 필터 (2026.08.10 추가)
+#    오즈 사무실 = 경기도 시흥시.  타 시·도 한정 공고는 신청 자체가 불가하다.
+#    ⚠️ 제목·요약만 보는 어림짐작이다. 확정이 아니라 「의심」 표시용이다.
+# ─────────────────────────────────────────────────────────────
+OUR_REGION = re.compile(
+    r"경기|시흥|안산|광명|부천|수원|성남|용인|화성|안양|전국|국내|중앙|대한민국"
+)
+OTHER_REGION = re.compile(
+    r"서울|부산|대구|광주광역|대전|울산|세종|강원|충북|충남|충청|전북|전남|전라|"
+    r"경북|경남|경상|제주|청주|천안|전주|여수|포항|창원|김해|진주|목포|순천|춘천|원주|익산"
+)
+# 「○○시 소재 / ○○도 기업 / ○○시민」처럼 자격을 못 박은 말
+REGION_LIMIT = re.compile(
+    r"(소재|주소|본사|사업장|거주|주민|시민|도민)\s*(한|기업|법인|단체|업체)?|"
+    r"관내|역내|지역\s*(기업|업체|단체|법인)|(에|으로)\s*한(정|함)"
+)
+REGION_PENALTY = -40      # 타지역 한정으로 의심될 때 감점
 
 EXCLUDE = re.compile(
     r"채용|구인|인턴|아르바이트|수강생\s*모집|학생\s*모집|"
@@ -308,6 +334,29 @@ def judge(item):
         if re.search(pat, text):
             score += pts
             reasons.append(why)
+
+    # 제목에 「모집·공모·신청」류가 없으면 = 남의 회사 소식. 크게 깎는다.
+    if not ACTION.search(item["title"]):
+        score += NEWS_ONLY
+        reasons.append("⚠️ 단순 보도")
+
+    # 🔴 지역 자격 — 오즈는 경기도 시흥 소재. 타 시·도 한정이면 신청 자체가 안 된다.
+    other = OTHER_REGION.search(text)
+    ours = OUR_REGION.search(text)
+    if other and not ours:
+        if REGION_LIMIT.search(text):
+            score += REGION_PENALTY
+            reasons.append(f"🚫 {other.group()} 한정 의심 — 오즈 신청 불가일 수 있음")
+            item["region_flag"] = "block"
+        else:
+            score -= 15
+            reasons.append(f"⚠️ {other.group()} 지역 건 — 자격 확인 필요")
+            item["region_flag"] = "check"
+    elif ours:
+        item["region_flag"] = "ok"
+    else:
+        item["region_flag"] = "unknown"
+
     if score < 40:
         return None
 
